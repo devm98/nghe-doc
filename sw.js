@@ -1,10 +1,16 @@
 // Lưu sẵn toàn bộ ứng dụng để dùng được khi không có mạng.
-const CACHE = 'nghe-doc-v1';
+// Bộ máy đọc (vendor/ort/*.wasm, ~10 MB) không lưu sẵn ở đây; nó được lưu khi người dùng tải giọng lần đầu.
+const CACHE = 'nghe-doc-v3';
 const ASSETS = [
   './',
   'index.html',
   'styles.css',
   'app.js',
+  'piper-worker.js',
+  'vendor/ort/ort.wasm.min.js',
+  'vendor/piper/piper_phonemize.js',
+  'vendor/piper/piper_phonemize.wasm',
+  'vendor/piper/piper_phonemize.data',
   'manifest.webmanifest',
   'icons/icon-180.png',
   'icons/icon-192.png',
@@ -21,7 +27,8 @@ self.addEventListener('install', (e) => {
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      // Chỉ xóa bản cũ của ứng dụng, KHÔNG xóa giọng đã tải về (nghe-doc-voices-*).
+      .then((keys) => Promise.all(keys.filter((k) => /^nghe-doc-v\d+$/.test(k) && k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });

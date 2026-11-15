@@ -18,6 +18,9 @@
   const PAGE_CHARS = 1800; // cỡ một "trang" với Word / văn bản dán
   const MAX_SENTENCE = 240;
 
+  // Một giây âm thanh im lặng: phát trong lúc người dùng bấm để iPhone cho phép phát tiếng về sau.
+  const SILENCE = 'data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA==';
+
   // ---------- Lưu trữ ----------
   const store = {
     get(k, d) {
@@ -68,9 +71,25 @@
   function openSheet(id) { $(id).hidden = false; }
   function closeSheets() { document.querySelectorAll('.sheet').forEach((s) => { s.hidden = true; }); }
   function message(text) { $('#msgText').textContent = text; openSheet('#sheetMsg'); }
-  function loading(text) {
+  function loading(text, onCancel) {
     $('#loading').hidden = !text;
     if (text) $('#loadingText').textContent = text;
+    const cancel = $('#btnLoadingCancel');
+    cancel.hidden = !(text && onCancel);
+    cancel.onclick = onCancel ? () => { loading(''); onCancel(); } : null;
+  }
+  // Hỏi Có / Không bằng hộp chữ to (thay cho confirm() chữ nhỏ của trình duyệt).
+  function ask(text, yes, no) {
+    return new Promise((resolve) => {
+      $('#askText').textContent = text;
+      $('#askYes').textContent = yes;
+      $('#askNo').textContent = no;
+      const done = (v) => { $('#sheetAsk').hidden = true; resolve(v); };
+      $('#askYes').onclick = () => done(true);
+      $('#askNo').onclick = () => done(false);
+      $('#sheetAsk').onclick = (e) => { if (e.target === $('#sheetAsk')) done(false); };
+      openSheet('#sheetAsk');
+    });
   }
   let toastTimer = 0;
   function toast(text) {
@@ -172,7 +191,7 @@
   function detectLang(pages) {
     const sample = pages.join(' ').slice(0, 6000);
     const letters = (sample.match(/\p{L}/gu) || []).length || 1;
-    const vi = (sample.match(/[ăâđêôơưĂÂĐÊÔƠƯẠ-ỹ]/g) || []).length;
+    const vi = (sample.match(/[ăâđêôơưĂÂĐÊÔƠƯẠ-ỹàáãèéìíòóõùúýĩũÀÁÃÈÉÌÍÒÓÕÙÚÝĨŨ]/g) || []).length;
     return vi / letters > 0.02 ? 'vi' : 'en';
   }
 
@@ -330,6 +349,7 @@
     st.pi = n;
     renderPage(false);
     if (st.playing) speakCurrent();
+    mediaSession(st.playing);
   }
 
   // ---------- Giọng đọc ----------
@@ -341,70 +361,332 @@
       if (!$('#sheetSettings').hidden) renderVoices();
     }
   }
+  // Giọng hiệu ứng vui của macOS, không hợp để đọc tài liệu.
+  const NOVELTY = /^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Fred|Good News|Jester|Junior|Kathy|Organ|Ralph|Superstar|Trinoids|Whisper|Wobble|Zarvox)\b/;
   const voiceLang = (v) => (v.lang || '').replace('_', '-').toLowerCase();
   function voicesFor(lang) {
-    return voices.filter((v) => voiceLang(v).indexOf(lang) === 0)
+    return voices.filter((v) => voiceLang(v).indexOf(lang) === 0 && !NOVELTY.test(v.name))
       .sort((a, b) => (b.localService ? 1 : 0) - (a.localService ? 1 : 0) || a.name.localeCompare(b.name));
   }
-  function currentVoice() {
+  // ---------- Giọng tải về (Piper): tải một lần, chạy ngay trong máy, không cần mạng ----------
+  // Cao độ đã đo: Mai ~235 Hz, Thu ~203 Hz, Lan ~250 Hz (nữ); Nam ~128 Hz, Hùng ~125 Hz (nam).
+  const VIVOS = 'vi/vi_VN/vivos/x_low/vi_VN-vivos-x_low';
+  const PIPER_VOICES = {
+    vi: [
+      { id: 'mai', name: 'Mai', note: 'Giọng nữ, rõ nhất', model: 'vi/vi_VN/vais1000/medium/vi_VN-vais1000-medium', mb: 63 },
+      { id: 'thu', name: 'Thu', note: 'Giọng nữ, trầm hơn', model: 'vi/vi_VN/25hours_single/low/vi_VN-25hours_single-low', mb: 63 },
+      { id: 'nam', name: 'Nam', note: 'Giọng nam', model: VIVOS, speaker: 38, mb: 28 },
+      { id: 'hung', name: 'Hùng', note: 'Giọng nam trầm', model: VIVOS, speaker: 56, mb: 28 },
+      { id: 'lan', name: 'Lan', note: 'Giọng nữ', model: VIVOS, speaker: 40, mb: 28 }
+    ]
+  };
+  const RECOMMENDED = { vi: 'mai' };
+  const ENGINE_MB = 12; // bộ máy đọc, chỉ tải lần đầu
+  const PIPER_HF = 'https://huggingface.co/rhasspy/piper-voices/resolve/main/';
+  const VOICE_CACHE = 'nghe-doc-voices-v1'; // phải khớp với piper-worker.js
+  const piperFor = (lang) => PIPER_VOICES[lang] || [];
+  const piperStored = new Set(); // các mô hình đã tải về máy
+  let piperOffUntil = 0; // giọng tải về bị lỗi: tạm dùng giọng của máy một lúc
+
+  async function refreshStored() {
+    if (!window.caches) return;
+    try {
+      const c = await caches.open(VOICE_CACHE);
+      const models = [...new Set(Object.values(PIPER_VOICES).flat().map((v) => v.model))];
+      await Promise.all(models.map(async (m) => {
+        if (await c.match(PIPER_HF + m + '.onnx')) piperStored.add(m); else piperStored.delete(m);
+      }));
+    } catch (e) { /* bộ nhớ bị chặn */ }
+  }
+
+  let worker = null;
+  let jobId = 0;
+  const jobs = new Map();
+  function piperWorker() {
+    if (!worker) {
+      worker = new Worker('piper-worker.js');
+      worker.onmessage = (e) => {
+        const m = e.data;
+        const j = jobs.get(m.id);
+        if (!j) return;
+        if (m.type === 'progress') { if (j.onProgress) j.onProgress(m.loaded, m.total); return; }
+        jobs.delete(m.id);
+        if (m.type === 'error') j.reject(new Error(m.message)); else j.resolve(m.wav);
+      };
+      worker.onerror = (e) => { console.warn('Bộ đọc lỗi', e); resetWorker(new Error('worker')); };
+    }
+    return worker;
+  }
+  function resetWorker(err) {
+    if (worker) worker.terminate();
+    worker = null;
+    jobs.forEach((j) => j.reject(err));
+    jobs.clear();
+    clearClips();
+  }
+  function piperCall(msg, onProgress) {
+    return new Promise((resolve, reject) => {
+      const id = ++jobId;
+      jobs.set(id, { resolve, reject, onProgress });
+      piperWorker().postMessage(Object.assign({ id }, msg));
+    });
+  }
+
+  const clips = new Map(); // khóa → Promise<địa chỉ blob wav>
+  function clearClips() {
+    clips.forEach((p) => p.then((u) => URL.revokeObjectURL(u), () => {}));
+    clips.clear();
+  }
+  function piperClip(text, v, urgent) {
+    const key = [v.model, v.speaker || 0, settings.rate, text].join('|');
+    if (clips.has(key)) return clips.get(key);
+    const p = piperCall({ type: 'speak', model: v.model, speaker: v.speaker || 0, text: text, rate: settings.rate, urgent: !!urgent })
+      .then((wav) => URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
+    p.catch(() => clips.delete(key));
+    clips.set(key, p);
+    while (clips.size > 40) { // giữ bộ nhớ gọn
+      const oldest = clips.keys().next().value;
+      clips.get(oldest).then((u) => URL.revokeObjectURL(u), () => {});
+      clips.delete(oldest);
+    }
+    return p;
+  }
+
+  function downloadMb(v) { return v.mb + (piperStored.size ? 0 : ENGINE_MB); }
+
+  async function downloadVoice(v) {
+    const ok = await ask('Tải giọng “' + v.name + '” về máy?\n\nCần khoảng ' + downloadMb(v) +
+      ' MB, chỉ tải một lần, sau đó đọc được cả khi không có mạng. Nên dùng Wi‑Fi.', 'Tải về', 'Để sau');
+    if (!ok) return false;
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* không bắt buộc */ }
+    let canceled = false;
+    loading('Đang tải giọng “' + v.name + '”…', () => { canceled = true; resetWorker(new Error('canceled')); });
+    try {
+      await piperCall({ type: 'load', model: v.model }, (loaded, total) => {
+        $('#loadingText').textContent = 'Đang tải giọng “' + v.name + '”… ' +
+          (total ? Math.floor(loaded * 100 / total) + '%' : Math.round(loaded / 1e6) + ' MB');
+      });
+      piperStored.add(v.model);
+      return true;
+    } catch (e) {
+      console.warn('Tải giọng lỗi', e);
+      if (!canceled) message('Chưa tải được giọng đọc. Hãy kiểm tra mạng rồi thử lại.');
+      return false;
+    } finally {
+      loading('');
+    }
+  }
+
+  async function removeVoices() {
+    const ok = await ask('Xóa các giọng đã tải về để lấy lại bộ nhớ? Khi cần có thể tải lại.', 'Xóa', 'Không');
+    if (!ok) return;
+    resetWorker(new Error('removed'));
+    try { await caches.delete(VOICE_CACHE); } catch (e) { /* bỏ qua */ }
+    piperStored.clear();
+    renderVoices();
+    toast('Đã xóa các giọng tải về.');
+  }
+
+  // ---------- Chọn giọng ----------
+  function deviceVoice() {
     const lang = doc ? doc.lang : 'vi';
     const list = voicesFor(lang);
     return list.find((v) => v.voiceURI === settings.voices[lang]) || list.find((v) => v.default) || list[0] || null;
+  }
+  // Giọng đang dùng: { piper: true, ... } (giọng tải về), một giọng có sẵn trong máy, hoặc null nếu chưa có giọng nào.
+  function currentVoice() {
+    const lang = doc ? doc.lang : 'vi';
+    const saved = settings.voices[lang] || '';
+    const usable = piperFor(lang).filter((v) => piperStored.has(v.model));
+    if (Date.now() >= piperOffUntil) {
+      const chosen = usable.find((v) => 'piper:' + v.id === saved);
+      if (chosen) return Object.assign({ piper: true }, chosen);
+      if (!voicesFor(lang).some((v) => v.voiceURI === saved) && usable.length) return Object.assign({ piper: true }, usable[0]);
+    }
+    return deviceVoice();
+  }
+
+  function voiceButton(title, subText, on, onPick) {
+    const b = document.createElement('button');
+    b.className = 'btn voice' + (on ? ' on' : '');
+    const left = document.createElement('span');
+    left.textContent = title;
+    const sub = document.createElement('small');
+    sub.textContent = subText;
+    left.appendChild(sub);
+    const tick = document.createElement('span');
+    tick.className = 'tick';
+    tick.textContent = on ? '✓ Đang dùng' : 'Chọn';
+    b.append(left, tick);
+    b.onclick = onPick;
+    return b;
+  }
+  function groupTitle(text) {
+    const h = document.createElement('p');
+    h.className = 'voice-group';
+    h.textContent = text;
+    return h;
   }
 
   function renderVoices() {
     const lang = doc ? doc.lang : 'vi';
     const list = voicesFor(lang);
+    const piperList = piperFor(lang);
     const box = $('#voiceList');
     const note = $('#voiceNote');
     box.innerHTML = '';
-    note.hidden = list.length > 0;
-    if (!list.length) {
-      note.textContent = lang === 'vi'
-        ? 'Máy này chưa có giọng tiếng Việt. Hãy vào Cài đặt của máy → Trợ năng → Nội dung được đọc / Chuyển văn bản thành giọng nói để tải thêm giọng tiếng Việt, rồi mở lại ứng dụng.'
-        : 'Máy này chưa có giọng đọc cho ngôn ngữ này.';
-    }
+    note.hidden = list.length > 0 || piperList.length > 0;
+    if (!note.hidden) note.textContent = 'Máy này chưa có giọng đọc cho ngôn ngữ này.';
     const cur = currentVoice();
+    const choose = (key) => {
+      settings.voices[lang] = key;
+      saveSettings();
+      piperOffUntil = 0;
+      renderVoices();
+      if (st.playing) speakCurrent(); else speakSample();
+    };
+    if (piperList.length) {
+      box.appendChild(groupTitle('Giọng tiếng Việt tải về — đọc được khi không có mạng'));
+      piperList.forEach((v) => {
+        const stored = piperStored.has(v.model);
+        const on = !!(cur && cur.piper && cur.id === v.id);
+        box.appendChild(voiceButton(v.name, v.note + (stored ? ' · đã tải' : ' · cần tải ' + downloadMb(v) + ' MB'), on, async () => {
+          unlockAudio();
+          if (!stored && !(await downloadVoice(v))) return;
+          choose('piper:' + v.id);
+        }));
+      });
+      if (list.length) box.appendChild(groupTitle('Giọng có sẵn trong máy'));
+    }
     list.forEach((v) => {
-      const on = cur && cur.voiceURI === v.voiceURI;
-      const b = document.createElement('button');
-      b.className = 'btn voice' + (on ? ' on' : '');
-      const left = document.createElement('span');
-      left.textContent = v.name.replace(/\s*\(.*?\)\s*/g, ' ').trim();
-      const sub = document.createElement('small');
-      sub.textContent = v.lang.replace('_', '-') + (v.localService ? ' · có sẵn trong máy' : ' · cần có mạng');
-      left.appendChild(sub);
-      const tick = document.createElement('span');
-      tick.className = 'tick';
-      tick.textContent = on ? '✓ Đang dùng' : 'Chọn';
-      b.append(left, tick);
-      b.onclick = () => {
-        settings.voices[lang] = v.voiceURI;
-        saveSettings();
-        renderVoices();
-        if (st.playing) speakCurrent(); else speakSample();
-      };
-      box.appendChild(b);
+      const on = !!(cur && !cur.piper && cur.voiceURI === v.voiceURI);
+      box.appendChild(voiceButton(
+        v.name.replace(/\s*\(.*$/, '').trim(),
+        v.lang.replace('_', '-') + (v.localService ? ' · có sẵn trong máy' : ' · cần có mạng'),
+        on, () => choose(v.voiceURI)));
     });
+    if (piperStored.size) {
+      const del = document.createElement('button');
+      del.className = 'btn small ghost';
+      del.textContent = 'Xóa các giọng đã tải về';
+      del.onclick = removeVoices;
+      box.appendChild(del);
+    }
   }
 
   function makeUtterance(text) {
     const u = new SpeechSynthesisUtterance(text);
-    const v = currentVoice();
+    const v = deviceVoice();
     if (v) { u.voice = v; u.lang = v.lang.replace('_', '-'); }
     else u.lang = doc && doc.lang === 'en' ? 'en-US' : 'vi-VN';
     u.rate = settings.rate;
     return u;
   }
+
+  // ---------- Phát âm thanh của giọng tải về ----------
+  const audio = new Audio();
+  audio.preload = 'auto';
+  let audioUnlocked = false;
+  // Phải gọi trong lúc người dùng đang bấm nút, nếu không iPhone sẽ chặn tiếng về sau.
+  function unlockAudio() {
+    if (audioUnlocked) return;
+    audioUnlocked = true;
+    audio.src = SILENCE;
+    audio.play().catch(() => { audioUnlocked = false; });
+  }
+
+  // Lần đầu nạp giọng mất vài giây: báo cho người dùng biết máy đang làm việc.
+  function slowNotice(promise) {
+    const t = setTimeout(() => toast('Đang chuẩn bị giọng đọc…'), 900);
+    promise.then(() => clearTimeout(t), () => clearTimeout(t));
+    return promise;
+  }
+
+  function piperFailed(v, e) {
+    console.warn('Giọng tải về lỗi', e);
+    refreshStored();
+    piperOffUntil = Date.now() + 60000;
+    if (deviceVoice()) { toast('Giọng “' + v.name + '” đang lỗi. Tạm dùng giọng có sẵn trong máy.'); return true; }
+    stop();
+    message('Chưa đọc được bằng giọng “' + v.name + '”. Hãy vào “Giọng & Chữ” để tải lại giọng.');
+    return false;
+  }
+
+  async function speakPiper(v, mine) {
+    const text = st.sentences[st.si];
+    let src;
+    try {
+      src = await slowNotice(piperClip(text, v, true));
+    } catch (e) {
+      if (mine !== token || !st.playing) return;
+      if (piperFailed(v, e)) speakCurrent();
+      return;
+    }
+    if (mine !== token || !st.playing) return;
+    // Chuẩn bị trước 2 câu kế tiếp để đọc liền mạch.
+    for (let i = 1; i <= 2; i++) {
+      const s = st.sentences[st.si + i];
+      if (s && /[\p{L}\p{N}]/u.test(s)) piperClip(s, v).catch(() => {});
+    }
+    audio.onended = () => {
+      if (mine !== token || !st.playing) return;
+      st.si++;
+      speakCurrent();
+    };
+    audio.onerror = () => {
+      if (mine !== token || !st.playing) return;
+      if (piperFailed(v, audio.error)) speakCurrent();
+    };
+    audio.src = src;
+    audio.play().catch((e) => {
+      if (mine !== token) return;
+      console.warn('Không phát được', e);
+      stop();
+      toast('Hãy bấm nút ĐỌC để bắt đầu.');
+    });
+  }
+
   function hush() {
     token++;
     if (synth && (synth.speaking || synth.pending)) synth.cancel();
+    audio.onended = audio.onerror = null;
+    if (!audio.paused) audio.pause();
   }
-  function speakSample() {
-    if (!synth) return;
+  function isSounding() {
+    return (!audio.paused && !audio.ended) || !!(synth && (synth.speaking || synth.pending));
+  }
+  async function speakSample() {
     hush();
-    utter = makeUtterance(SAMPLE[doc ? doc.lang : 'vi']);
+    const mine = token;
+    const text = SAMPLE[doc ? doc.lang : 'vi'];
+    const v = currentVoice();
+    if (v && v.piper) {
+      unlockAudio();
+      try {
+        const src = await slowNotice(piperClip(text, v, true));
+        if (mine !== token) return;
+        audio.src = src;
+        audio.play().catch(() => {});
+      } catch (e) { if (mine === token) piperFailed(v, e); }
+      return;
+    }
+    if (!synth || !v) return;
+    utter = makeUtterance(text);
     synth.speak(utter);
+  }
+
+  // Chưa có giọng nào cho ngôn ngữ này: mời tải giọng gợi ý rồi đọc luôn.
+  async function offerVoice() {
+    const lang = doc ? doc.lang : 'vi';
+    const v = piperFor(lang).find((x) => x.id === RECOMMENDED[lang]);
+    if (!v) {
+      message('Máy này chưa có giọng đọc cho ngôn ngữ này. Hãy thử mở bằng Chrome (Android) hoặc Safari (iPhone).');
+      return;
+    }
+    if (!(await downloadVoice(v))) return;
+    settings.voices[lang] = 'piper:' + v.id;
+    saveSettings();
+    play();
   }
 
   // ---------- Phát / dừng ----------
@@ -427,6 +709,7 @@
     $('#icoPause').toggleAttribute('hidden', !on);
     $('#playLabel').textContent = on ? 'DỪNG' : 'ĐỌC';
     keepScreenOn(on);
+    mediaSession(on);
   }
 
   function stop() {
@@ -436,7 +719,12 @@
   }
 
   function speakCurrent() {
-    if (!synth) { message('Trình duyệt này không hỗ trợ đọc thành tiếng. Hãy mở bằng Chrome (Android) hoặc Safari (iPhone).'); return; }
+    const v = currentVoice();
+    if (!v || (!v.piper && !synth)) {
+      stop();
+      offerVoice();
+      return;
+    }
     hush();
     const mine = token;
     // Bỏ qua các "câu" chỉ có ký hiệu, không có chữ hay số.
@@ -444,6 +732,7 @@
     if (st.si >= st.sentences.length) { nextPageAuto(); return; }
     highlight();
     savePos();
+    if (v.piper) { speakPiper(v, mine); return; }
     const u = makeUtterance(st.sentences[st.si]);
     u.onend = () => {
       if (mine !== token || !st.playing) return;
@@ -462,6 +751,26 @@
     synth.speak(u);
   }
 
+  // Nút điều khiển trên màn hình khóa / tai nghe.
+  function mediaSession(on) {
+    const ms = navigator.mediaSession;
+    if (!ms) return;
+    ms.playbackState = on ? 'playing' : 'paused';
+    if (on && doc && window.MediaMetadata) {
+      ms.metadata = new MediaMetadata({
+        title: doc.name, artist: 'Nghe Đọc · Trang ' + (st.pi + 1),
+        artwork: [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }]
+      });
+    }
+  }
+  if (navigator.mediaSession) {
+    const set = (a, fn) => { try { navigator.mediaSession.setActionHandler(a, fn); } catch (e) { /* không hỗ trợ */ } };
+    set('play', () => { if (doc && !st.playing) play(); });
+    set('pause', () => { if (st.playing) stop(); });
+    set('nexttrack', () => step(1));
+    set('previoustrack', () => step(-1));
+  }
+
   function nextPageAuto() {
     let n = st.pi + 1;
     while (n < doc.pages.length && !doc.pages[n].trim()) n++;
@@ -476,7 +785,7 @@
     speakCurrent();
   }
 
-  function play() { setPlaying(true); speakCurrent(); }
+  function play() { unlockAudio(); setPlaying(true); speakCurrent(); }
 
   function step(d) {
     if (!doc) return;
@@ -596,9 +905,9 @@
       if (document.visibilityState !== 'visible' || !st.playing) return;
       keepScreenOn(true);
       // Điện thoại có thể ngắt tiếng khi tắt màn hình: quay lại thì đọc tiếp câu đang dở.
-      setTimeout(() => { if (st.playing && synth && !synth.speaking && !synth.pending) speakCurrent(); }, 400);
+      setTimeout(() => { if (st.playing && !isSounding()) speakCurrent(); }, 400);
     });
-    window.addEventListener('pagehide', () => { if (synth) synth.cancel(); });
+    window.addEventListener('pagehide', () => { if (synth) synth.cancel(); audio.pause(); });
 
     // Cài đặt như ứng dụng
     let installEvt = null;
@@ -615,6 +924,7 @@
   applyLook();
   bind();
   renderLibrary();
+  refreshStored().then(() => { if (!$('#sheetSettings').hidden) renderVoices(); });
   if (synth) {
     loadVoices();
     synth.onvoiceschanged = loadVoices;
