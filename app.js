@@ -1,0 +1,631 @@
+(function () {
+  'use strict';
+
+  const $ = (s) => document.querySelector(s);
+  const synth = window.speechSynthesis;
+
+  const SPEEDS = [
+    { label: 'Rất chậm', rate: 0.6 },
+    { label: 'Chậm', rate: 0.8 },
+    { label: 'Vừa', rate: 1 },
+    { label: 'Nhanh', rate: 1.25 },
+    { label: 'Rất nhanh', rate: 1.5 }
+  ];
+  const SAMPLE = {
+    vi: 'Xin chào, tôi sẽ đọc tài liệu cho bạn nghe.',
+    en: 'Hello, I will read this document for you.'
+  };
+  const PAGE_CHARS = 1800; // cỡ một "trang" với Word / văn bản dán
+  const MAX_SENTENCE = 240;
+
+  // ---------- Lưu trữ ----------
+  const store = {
+    get(k, d) {
+      try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; }
+    },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* đầy bộ nhớ */ } },
+    del(k) { try { localStorage.removeItem(k); } catch (e) { /* bỏ qua */ } }
+  };
+  const settings = Object.assign({ rate: 1, fontSize: 22, theme: 'light', voices: {} }, store.get('settings', {}));
+  const saveSettings = () => store.set('settings', settings);
+
+  let dbPromise = null;
+  function db() {
+    if (!dbPromise) {
+      dbPromise = new Promise((res, rej) => {
+        const r = indexedDB.open('nghe-doc', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('docs', { keyPath: 'id' });
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+    }
+    return dbPromise;
+  }
+  async function idb(mode, fn) {
+    const d = await db();
+    return new Promise((res, rej) => {
+      const tx = d.transaction('docs', mode);
+      const rq = fn(tx.objectStore('docs'));
+      tx.oncomplete = () => res(rq && rq.result);
+      tx.onerror = () => rej(tx.error);
+      tx.onabort = () => rej(tx.error);
+    });
+  }
+
+  // ---------- Trạng thái ----------
+  let doc = null;
+  const st = { pi: 0, si: 0, sentences: [], playing: false };
+  let voices = [];
+  let token = 0;
+  let utter = null; // giữ tham chiếu để trình duyệt không thu hồi giữa chừng
+
+  // ---------- Tiện ích giao diện ----------
+  function showView(name) {
+    $('#home').hidden = name !== 'home';
+    $('#reader').hidden = name !== 'reader';
+    window.scrollTo(0, 0);
+  }
+  function openSheet(id) { $(id).hidden = false; }
+  function closeSheets() { document.querySelectorAll('.sheet').forEach((s) => { s.hidden = true; }); }
+  function message(text) { $('#msgText').textContent = text; openSheet('#sheetMsg'); }
+  function loading(text) {
+    $('#loading').hidden = !text;
+    if (text) $('#loadingText').textContent = text;
+  }
+  let toastTimer = 0;
+  function toast(text) {
+    const t = $('#toast');
+    t.textContent = text; t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.hidden = true; }, 3500);
+  }
+  function applyLook() {
+    document.documentElement.dataset.theme = settings.theme;
+    document.documentElement.style.setProperty('--read-size', settings.fontSize + 'px');
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.content = settings.theme === 'dark' ? '#101317' : '#0b5cad';
+  }
+
+  // ---------- Đọc tệp ----------
+  function userError(msg) { const e = new Error(msg); e.userMsg = msg; return e; }
+
+  function readFile(file, as) {
+    return new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = () => rej(fr.error);
+      if (as === 'text') fr.readAsText(file); else fr.readAsArrayBuffer(file);
+    });
+  }
+  const loaded = {};
+  function loadScript(src) {
+    if (!loaded[src]) {
+      loaded[src] = new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = src; s.onload = res;
+        s.onerror = () => { delete loaded[src]; rej(new Error('Không tải được ' + src)); };
+        document.head.appendChild(s);
+      });
+    }
+    return loaded[src];
+  }
+
+  // Ghép các mảnh chữ của pdf.js thành đoạn văn; khoảng cách dọc lớn = xuống đoạn.
+  function pdfItemsToText(items) {
+    let out = '', lastY = null, lastH = 0;
+    for (const it of items) {
+      if (typeof it.str !== 'string') continue;
+      const y = it.transform[5];
+      const h = it.height || lastH;
+      if (lastY !== null && Math.abs(y - lastY) > Math.max(h, lastH, 1) * 1.8) out += '\n\n';
+      out += it.str;
+      if (it.hasEOL) out += '\n';
+      if (it.str.trim()) { lastY = y; lastH = h || lastH; }
+    }
+    return out.replace(/\r/g, '')
+      .replace(/[ \t ]+/g, ' ')
+      .replace(/ ?\n ?/g, '\n')
+      .replace(/(\p{Ll})-\n(\p{Ll})/gu, '$1$2')
+      .replace(/\n{2,}/g, '\u0001')
+      .replace(/\n/g, ' ')
+      .replace(/\u0001/g, '\n\n')
+      .replace(/ {2,}/g, ' ')
+      .trim();
+  }
+
+  async function extractPdf(file) {
+    await loadScript('vendor/pdf.min.js');
+    const pdfjsLib = window.pdfjsLib;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
+    const pdf = await pdfjsLib.getDocument({ data: await readFile(file) }).promise;
+    const pages = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      loading('Đang mở trang ' + i + ' / ' + pdf.numPages + '…');
+      const page = await pdf.getPage(i);
+      const tc = await page.getTextContent();
+      pages.push(pdfItemsToText(tc.items));
+      page.cleanup();
+    }
+    pdf.destroy();
+    return pages;
+  }
+
+  async function extractDocx(file) {
+    await loadScript('vendor/mammoth.browser.min.js');
+    const r = await window.mammoth.extractRawText({ arrayBuffer: await readFile(file) });
+    return r.value;
+  }
+
+  // Word / văn bản không có trang thật: tự chia thành các trang vừa đọc.
+  function paginate(text) {
+    const paras = text.replace(/\r/g, '').split(/\n+/).map((p) => p.replace(/\s+/g, ' ').trim()).filter(Boolean);
+    const pages = [];
+    let cur = [], len = 0;
+    for (const p of paras) {
+      if (len && len + p.length > PAGE_CHARS) { pages.push(cur.join('\n\n')); cur = []; len = 0; }
+      cur.push(p); len += p.length;
+    }
+    if (cur.length) pages.push(cur.join('\n\n'));
+    return pages;
+  }
+
+  function detectLang(pages) {
+    const sample = pages.join(' ').slice(0, 6000);
+    const letters = (sample.match(/\p{L}/gu) || []).length || 1;
+    const vi = (sample.match(/[ăâđêôơưĂÂĐÊÔƠƯẠ-ỹ]/g) || []).length;
+    return vi / letters > 0.02 ? 'vi' : 'en';
+  }
+
+  async function openFile(file) {
+    const name = file.name || 'Tài liệu';
+    const ext = (name.match(/\.([^.]+)$/) || [])[1];
+    const kind = (ext || '').toLowerCase();
+    const type = file.type || '';
+    loading('Đang mở tài liệu…');
+    try {
+      let pages;
+      if (kind === 'pdf' || type === 'application/pdf') pages = await extractPdf(file);
+      else if (kind === 'docx') pages = paginate(await extractDocx(file));
+      else if (kind === 'doc') throw userError('Tệp Word đời cũ (.doc) chưa đọc được. Hãy nhờ người lưu lại thành .docx hoặc PDF rồi mở lại.');
+      else if (kind === 'txt' || type.indexOf('text/') === 0) pages = paginate(await readFile(file, 'text'));
+      else throw userError('Loại tệp này chưa hỗ trợ. Hãy chọn tệp PDF, Word (.docx) hoặc văn bản (.txt).');
+      if (!pages.some((p) => p.trim())) {
+        throw userError('Không tìm thấy chữ trong tài liệu này. Có thể đây là bản chụp ảnh (scan) nên máy chưa đọc được.');
+      }
+      await addDoc(name.replace(/\.[^.]+$/, ''), pages);
+    } catch (e) {
+      console.error(e);
+      message(e.userMsg || 'Không mở được tài liệu này. Xin thử lại với tệp khác.');
+    } finally {
+      loading('');
+    }
+  }
+
+  async function addDoc(name, pages) {
+    const d = { id: Date.now().toString(36), name: name, pages: pages, lang: detectLang(pages), openedAt: Date.now() };
+    try { await idb('readwrite', (s) => s.put(d)); } catch (e) { console.warn('Không lưu được tài liệu', e); }
+    openDoc(d);
+  }
+
+  // ---------- Thư viện ----------
+  async function renderLibrary() {
+    let docs = [];
+    try { docs = (await idb('readonly', (s) => s.getAll())) || []; } catch (e) { console.warn(e); }
+    docs.sort((a, b) => (b.openedAt || 0) - (a.openedAt || 0));
+    const list = $('#docList');
+    list.innerHTML = '';
+    $('#library').hidden = !docs.length;
+    docs.forEach((d) => {
+      const pos = store.get('pos:' + d.id, { pi: 0 });
+      const row = document.createElement('div');
+      row.className = 'doc';
+      const open = document.createElement('button');
+      open.className = 'btn open';
+      const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
+      const meta = document.createElement('span'); meta.className = 'meta';
+      meta.textContent = 'Đang ở trang ' + (pos.pi + 1) + ' / ' + d.pages.length + ' — bấm để nghe tiếp';
+      open.append(nm, meta);
+      open.onclick = () => openDoc(d);
+      const del = document.createElement('button');
+      del.className = 'btn del'; del.textContent = 'Xóa';
+      del.setAttribute('aria-label', 'Xóa ' + d.name);
+      del.onclick = async () => {
+        if (!confirm('Xóa tài liệu “' + d.name + '” khỏi danh sách?')) return;
+        await idb('readwrite', (s) => s.delete(d.id));
+        store.del('pos:' + d.id);
+        renderLibrary();
+      };
+      row.append(open, del);
+      list.appendChild(row);
+    });
+  }
+
+  // ---------- Màn hình đọc ----------
+  function openDoc(d) {
+    doc = d;
+    doc.openedAt = Date.now();
+    idb('readwrite', (s) => s.put(doc)).catch(() => {});
+    const pos = store.get('pos:' + d.id, { pi: 0, si: 0 });
+    st.pi = Math.min(pos.pi || 0, d.pages.length - 1);
+    st.si = pos.si || 0;
+    $('#docTitle').textContent = d.name;
+    showView('reader');
+    renderPage(true);
+  }
+
+  function splitSentences(text) {
+    let parts = [];
+    if (window.Intl && Intl.Segmenter) {
+      const seg = new Intl.Segmenter(doc ? doc.lang : 'vi', { granularity: 'sentence' });
+      for (const s of seg.segment(text)) parts.push(s.segment);
+    } else {
+      parts = text.match(/[^.!?…]+[.!?…]+["'”’)\]]*\s*|[^.!?…]+$/g) || [text];
+    }
+    const out = [];
+    for (let p of parts) {
+      p = p.trim();
+      // Câu quá dài: cắt ở dấu phẩy gần nhất để máy đọc không bị ngắt giữa chừng.
+      while (p.length > MAX_SENTENCE) {
+        let cut = Math.max(p.lastIndexOf(', ', MAX_SENTENCE), p.lastIndexOf('; ', MAX_SENTENCE), p.lastIndexOf(': ', MAX_SENTENCE));
+        if (cut < 60) cut = p.lastIndexOf(' ', MAX_SENTENCE);
+        cut = cut < 60 ? MAX_SENTENCE : cut + 1;
+        out.push(p.slice(0, cut).trim());
+        p = p.slice(cut).trim();
+      }
+      if (p) out.push(p);
+    }
+    return out;
+  }
+
+  function renderPage(keepSentence) {
+    const el = $('#text');
+    const text = doc.pages[st.pi] || '';
+    el.innerHTML = '';
+    st.sentences = [];
+    if (!keepSentence) st.si = 0;
+    if (!text.trim()) {
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = 'Trang này không có chữ để đọc (có thể là hình ảnh).';
+      el.appendChild(p);
+    } else {
+      text.split('\n\n').forEach((para) => {
+        const p = document.createElement('p');
+        splitSentences(para).forEach((s) => {
+          const span = document.createElement('span');
+          span.className = 's';
+          span.dataset.i = st.sentences.length;
+          span.textContent = s + ' ';
+          st.sentences.push(s);
+          p.appendChild(span);
+        });
+        el.appendChild(p);
+      });
+    }
+    if (st.si >= st.sentences.length) st.si = 0;
+    const n = doc.pages.length;
+    $('#pageLabel').textContent = 'Trang ' + (st.pi + 1) + ' / ' + n;
+    $('#progressFill').style.width = ((st.pi + 1) / n * 100) + '%';
+    $('#btnPrevPage').disabled = st.pi === 0;
+    $('#btnNextPage').disabled = st.pi >= n - 1;
+    el.scrollTop = 0;
+    highlight();
+    savePos();
+  }
+
+  function highlight() {
+    const el = $('#text');
+    const prev = el.querySelector('.s.on');
+    if (prev) prev.classList.remove('on');
+    const cur = el.querySelector('.s[data-i="' + st.si + '"]');
+    if (!cur) return;
+    cur.classList.add('on');
+    try { cur.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) { cur.scrollIntoView(); }
+  }
+
+  function savePos() { if (doc) store.set('pos:' + doc.id, { pi: st.pi, si: st.si }); }
+
+  function goPage(n) {
+    if (!doc || n < 0 || n >= doc.pages.length) return;
+    st.pi = n;
+    renderPage(false);
+    if (st.playing) speakCurrent();
+  }
+
+  // ---------- Giọng đọc ----------
+  function loadVoices() {
+    if (!synth) return;
+    const v = synth.getVoices();
+    if (v && v.length) {
+      voices = v.slice();
+      if (!$('#sheetSettings').hidden) renderVoices();
+    }
+  }
+  const voiceLang = (v) => (v.lang || '').replace('_', '-').toLowerCase();
+  function voicesFor(lang) {
+    return voices.filter((v) => voiceLang(v).indexOf(lang) === 0)
+      .sort((a, b) => (b.localService ? 1 : 0) - (a.localService ? 1 : 0) || a.name.localeCompare(b.name));
+  }
+  function currentVoice() {
+    const lang = doc ? doc.lang : 'vi';
+    const list = voicesFor(lang);
+    return list.find((v) => v.voiceURI === settings.voices[lang]) || list.find((v) => v.default) || list[0] || null;
+  }
+
+  function renderVoices() {
+    const lang = doc ? doc.lang : 'vi';
+    const list = voicesFor(lang);
+    const box = $('#voiceList');
+    const note = $('#voiceNote');
+    box.innerHTML = '';
+    note.hidden = list.length > 0;
+    if (!list.length) {
+      note.textContent = lang === 'vi'
+        ? 'Máy này chưa có giọng tiếng Việt. Hãy vào Cài đặt của máy → Trợ năng → Nội dung được đọc / Chuyển văn bản thành giọng nói để tải thêm giọng tiếng Việt, rồi mở lại ứng dụng.'
+        : 'Máy này chưa có giọng đọc cho ngôn ngữ này.';
+    }
+    const cur = currentVoice();
+    list.forEach((v) => {
+      const on = cur && cur.voiceURI === v.voiceURI;
+      const b = document.createElement('button');
+      b.className = 'btn voice' + (on ? ' on' : '');
+      const left = document.createElement('span');
+      left.textContent = v.name.replace(/\s*\(.*?\)\s*/g, ' ').trim();
+      const sub = document.createElement('small');
+      sub.textContent = v.lang.replace('_', '-') + (v.localService ? ' · có sẵn trong máy' : ' · cần có mạng');
+      left.appendChild(sub);
+      const tick = document.createElement('span');
+      tick.className = 'tick';
+      tick.textContent = on ? '✓ Đang dùng' : 'Chọn';
+      b.append(left, tick);
+      b.onclick = () => {
+        settings.voices[lang] = v.voiceURI;
+        saveSettings();
+        renderVoices();
+        if (st.playing) speakCurrent(); else speakSample();
+      };
+      box.appendChild(b);
+    });
+  }
+
+  function makeUtterance(text) {
+    const u = new SpeechSynthesisUtterance(text);
+    const v = currentVoice();
+    if (v) { u.voice = v; u.lang = v.lang.replace('_', '-'); }
+    else u.lang = doc && doc.lang === 'en' ? 'en-US' : 'vi-VN';
+    u.rate = settings.rate;
+    return u;
+  }
+  function hush() {
+    token++;
+    if (synth && (synth.speaking || synth.pending)) synth.cancel();
+  }
+  function speakSample() {
+    if (!synth) return;
+    hush();
+    utter = makeUtterance(SAMPLE[doc ? doc.lang : 'vi']);
+    synth.speak(utter);
+  }
+
+  // ---------- Phát / dừng ----------
+  let wakeLock = null;
+  async function keepScreenOn(on) {
+    try {
+      if (on && !wakeLock && navigator.wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } else if (!on && wakeLock) {
+        const w = wakeLock; wakeLock = null; await w.release();
+      }
+    } catch (e) { /* không bắt buộc */ }
+  }
+
+  function setPlaying(on) {
+    st.playing = on;
+    $('#btnPlay').classList.toggle('playing', on);
+    $('#icoPlay').toggleAttribute('hidden', on); // SVG không có thuộc tính .hidden
+    $('#icoPause').toggleAttribute('hidden', !on);
+    $('#playLabel').textContent = on ? 'DỪNG' : 'ĐỌC';
+    keepScreenOn(on);
+  }
+
+  function stop() {
+    hush();
+    setPlaying(false);
+    savePos();
+  }
+
+  function speakCurrent() {
+    if (!synth) { message('Trình duyệt này không hỗ trợ đọc thành tiếng. Hãy mở bằng Chrome (Android) hoặc Safari (iPhone).'); return; }
+    hush();
+    const mine = token;
+    // Bỏ qua các "câu" chỉ có ký hiệu, không có chữ hay số.
+    while (st.si < st.sentences.length && !/[\p{L}\p{N}]/u.test(st.sentences[st.si])) st.si++;
+    if (st.si >= st.sentences.length) { nextPageAuto(); return; }
+    highlight();
+    savePos();
+    const u = makeUtterance(st.sentences[st.si]);
+    u.onend = () => {
+      if (mine !== token || !st.playing) return;
+      st.si++;
+      speakCurrent();
+    };
+    u.onerror = (e) => {
+      if (mine !== token || e.error === 'interrupted' || e.error === 'canceled') return;
+      console.warn('Lỗi đọc', e.error);
+      stop();
+      if (e.error === 'not-allowed') toast('Hãy bấm nút ĐỌC để bắt đầu.');
+      else toast('Máy chưa đọc được câu này. Thử chọn giọng khác.');
+    };
+    utter = u;
+    if (synth.paused) synth.resume();
+    synth.speak(u);
+  }
+
+  function nextPageAuto() {
+    let n = st.pi + 1;
+    while (n < doc.pages.length && !doc.pages[n].trim()) n++;
+    if (n >= doc.pages.length) {
+      stop();
+      st.si = 0; highlight(); savePos();
+      toast('Đã đọc hết tài liệu.');
+      return;
+    }
+    st.pi = n;
+    renderPage(false);
+    speakCurrent();
+  }
+
+  function play() { setPlaying(true); speakCurrent(); }
+
+  function step(d) {
+    if (!doc) return;
+    const next = st.si + d;
+    if (next < 0) { st.si = 0; }
+    else if (next >= st.sentences.length) {
+      if (st.pi < doc.pages.length - 1) { goPage(st.pi + 1); return; }
+      return;
+    } else st.si = next;
+    highlight(); savePos();
+    if (st.playing) speakCurrent();
+  }
+
+  // ---------- Cài đặt ----------
+  function renderSettings() {
+    const box = $('#speedList');
+    box.innerHTML = '';
+    SPEEDS.forEach((sp) => {
+      const b = document.createElement('button');
+      b.className = 'btn' + (sp.rate === settings.rate ? ' on' : '');
+      b.textContent = sp.label;
+      b.onclick = () => {
+        settings.rate = sp.rate; saveSettings(); renderSettings();
+        if (st.playing) speakCurrent(); else speakSample();
+      };
+      box.appendChild(b);
+    });
+    document.querySelectorAll('#themeList .btn').forEach((b) => b.classList.toggle('on', b.dataset.theme === settings.theme));
+    document.querySelectorAll('#langList .btn').forEach((b) => b.classList.toggle('on', !!doc && b.dataset.lang === doc.lang));
+    renderVoices();
+  }
+
+  // ---------- Gắn sự kiện ----------
+  function bind() {
+    $('#btnOpen').onclick = () => $('#file').click();
+    $('#file').onchange = (e) => {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (f) openFile(f);
+    };
+
+    $('#btnPaste').onclick = () => { $('#pasteArea').value = ''; openSheet('#sheetPaste'); };
+    $('#btnClipboard').onclick = async () => {
+      try {
+        const t = await navigator.clipboard.readText();
+        if (t) $('#pasteArea').value = t; else toast('Bộ nhớ tạm đang trống.');
+      } catch (e) { toast('Hãy nhấn giữ vào ô bên dưới rồi chọn “Dán”.'); }
+    };
+    $('#btnPasteGo').onclick = () => {
+      const t = $('#pasteArea').value.trim();
+      if (!t) { toast('Chưa có văn bản để đọc.'); return; }
+      closeSheets();
+      const title = t.replace(/\s+/g, ' ').slice(0, 40) + (t.length > 40 ? '…' : '');
+      addDoc(title, paginate(t));
+    };
+
+    $('#btnBack').onclick = () => { stop(); doc = null; showView('home'); renderLibrary(); };
+    $('#btnPlay').onclick = () => (st.playing ? stop() : play());
+    $('#btnPrev').onclick = () => step(-1);
+    $('#btnNext').onclick = () => step(1);
+    $('#btnPrevPage').onclick = () => goPage(st.pi - 1);
+    $('#btnNextPage').onclick = () => goPage(st.pi + 1);
+
+    $('#text').onclick = (e) => {
+      const span = e.target.closest ? e.target.closest('.s') : null;
+      if (!span) return;
+      st.si = +span.dataset.i;
+      play();
+    };
+
+    $('#btnPageJump').onclick = () => {
+      const n = doc.pages.length;
+      $('#jumpInfo').textContent = 'Tài liệu có ' + n + ' trang. Nhập số trang muốn nghe:';
+      const inp = $('#jumpInput');
+      inp.max = n; inp.value = st.pi + 1;
+      openSheet('#sheetJump');
+      inp.select();
+    };
+    const jump = () => {
+      const n = parseInt($('#jumpInput').value, 10);
+      if (!n || n < 1 || n > doc.pages.length) { toast('Số trang phải từ 1 đến ' + doc.pages.length + '.'); return; }
+      closeSheets();
+      goPage(n - 1);
+    };
+    $('#btnJumpGo').onclick = jump;
+    $('#jumpInput').onkeydown = (e) => { if (e.key === 'Enter') jump(); };
+
+    $('#btnSettings').onclick = () => { renderSettings(); openSheet('#sheetSettings'); };
+    $('#btnFontUp').onclick = () => { settings.fontSize = Math.min(44, settings.fontSize + 3); saveSettings(); applyLook(); highlight(); };
+    $('#btnFontDown').onclick = () => { settings.fontSize = Math.max(16, settings.fontSize - 3); saveSettings(); applyLook(); highlight(); };
+    document.querySelectorAll('#themeList .btn').forEach((b) => {
+      b.onclick = () => { settings.theme = b.dataset.theme; saveSettings(); applyLook(); renderSettings(); };
+    });
+    document.querySelectorAll('#langList .btn').forEach((b) => {
+      b.onclick = () => {
+        if (!doc || doc.lang === b.dataset.lang) return;
+        const was = st.playing;
+        stop();
+        doc.lang = b.dataset.lang;
+        idb('readwrite', (s) => s.put(doc)).catch(() => {});
+        renderPage(false);
+        renderSettings();
+        if (was) play();
+      };
+    });
+
+    document.querySelectorAll('.sheet').forEach((sheet) => {
+      sheet.addEventListener('click', (e) => {
+        if (e.target === sheet || e.target.closest('[data-close]')) {
+          sheet.hidden = true;
+          if (!st.playing) hush(); // tắt câu nghe thử
+        }
+      });
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible' || !st.playing) return;
+      keepScreenOn(true);
+      // Điện thoại có thể ngắt tiếng khi tắt màn hình: quay lại thì đọc tiếp câu đang dở.
+      setTimeout(() => { if (st.playing && synth && !synth.speaking && !synth.pending) speakCurrent(); }, 400);
+    });
+    window.addEventListener('pagehide', () => { if (synth) synth.cancel(); });
+
+    // Cài đặt như ứng dụng
+    let installEvt = null;
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault(); installEvt = e; $('#btnInstall').hidden = false;
+    });
+    $('#btnInstall').onclick = () => { if (installEvt) { installEvt.prompt(); installEvt = null; $('#btnInstall').hidden = true; } };
+    const standalone = window.navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (isIOS && !standalone) $('#iosHint').hidden = false;
+  }
+
+  // ---------- Khởi động ----------
+  applyLook();
+  bind();
+  renderLibrary();
+  if (synth) {
+    loadVoices();
+    synth.onvoiceschanged = loadVoices;
+    // iOS đôi khi không báo sự kiện voiceschanged: hỏi lại vài lần.
+    let tries = 0;
+    const poll = setInterval(() => { loadVoices(); if (voices.length || ++tries > 10) clearInterval(poll); }, 300);
+    synth.cancel();
+  }
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+    navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
+  }
+
+  window.ngheDoc = { openFile: openFile };
+})();

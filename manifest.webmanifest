@@ -1,0 +1,17 @@
+{
+  "name": "Nghe Đọc — đọc to tài liệu",
+  "short_name": "Nghe Đọc",
+  "description": "Đọc to tài liệu PDF, Word bằng giọng nói. Chữ to, nút lớn, dễ dùng.",
+  "lang": "vi",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f6f4ee",
+  "theme_color": "#0b5cad",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nghe Đọc</title>
+<meta name="description" content="Đọc to tài liệu PDF, Word bằng giọng nói. Chữ to, nút lớn, dễ dùng.">
+<meta name="theme-color" content="#0b5cad">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Nghe Đọc">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ============ MÀN HÌNH CHÍNH ============ -->
+<main id="home" class="view">
+  <header class="home-head">
+    <img src="icons/icon-192.png" alt="" width="56" height="56">
+    <div>
+      <h1>Nghe Đọc</h1>
+      <p>Mở tài liệu, máy đọc to cho bạn nghe</p>
+    </div>
+  </header>
+
+  <button id="btnOpen" class="btn primary huge">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6a2 2 0 0 1 2-2h4.5l2 2.5H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+    <span>Mở tài liệu<small>PDF, Word (.docx), văn bản</small></span>
+  </button>
+  <button id="btnPaste" class="btn huge">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6a1 1 0 0 1 1 1v1h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2V4a1 1 0 0 1 1-1zm1 2v2h4V5zM8 11v2h8v-2zm0 4v2h6v-2z"/></svg>
+    <span>Dán văn bản<small>Chép chữ từ nơi khác vào đây</small></span>
+  </button>
+  <input id="file" type="file" hidden
+    accept=".pdf,.docx,.doc,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain">
+
+  <section id="library" hidden>
+    <h2>Tài liệu đã mở</h2>
+    <div id="docList"></div>
+  </section>
+
+  <button id="btnInstall" class="btn" hidden>Cài ứng dụng vào máy</button>
+  <p id="iosHint" class="hint" hidden>Để cài lên màn hình chính iPhone: bấm nút <b>Chia sẻ</b> của Safari rồi chọn <b>“Thêm vào MH chính”</b>.</p>
+</main>
+
+<!-- ============ MÀN HÌNH ĐỌC ============ -->
+<main id="reader" class="view" hidden>
+  <header class="bar">
+    <button id="btnBack" class="btn small" aria-label="Trở về">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 4.5 8 12l7.5 7.5-1.8 1.8L4.4 12l9.3-9.3z"/></svg>Trở về
+    </button>
+    <div id="docTitle" class="title"></div>
+    <button id="btnSettings" class="btn small">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h9v2H3zm13 0h5v2h-5zM3 11h3v2H3zm7 0h11v2H10zM3 16h10v2H3zm14 0h4v2h-4z"/><circle cx="14" cy="7" r="2.5"/><circle cx="8" cy="12" r="2.5"/><circle cx="15" cy="17" r="2.5"/></svg>Giọng &amp; Chữ
+    </button>
+  </header>
+  <div class="progress"><div id="progressFill"></div></div>
+
+  <article id="text" aria-live="off"></article>
+
+  <footer class="controls">
+    <div class="row pages">
+      <button id="btnPrevPage" class="btn small">◀ Trang trước</button>
+      <button id="btnPageJump" class="btn small ghost"><span id="pageLabel">Trang 1 / 1</span></button>
+      <button id="btnNextPage" class="btn small">Trang sau ▶</button>
+    </div>
+    <div class="row main">
+      <button id="btnPrev" class="btn side" aria-label="Câu trước">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 6v12l-8-6zm10 0v12l-8-6z"/></svg><span>Lùi lại</span>
+      </button>
+      <button id="btnPlay" class="btn primary play">
+        <svg id="icoPlay" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>
+        <svg id="icoPause" viewBox="0 0 24 24" aria-hidden="true" hidden><path d="M6 4h4v16H6zm8 0h4v16h-4z"/></svg>
+        <span id="playLabel">ĐỌC</span>
+      </button>
+      <button id="btnNext" class="btn side" aria-label="Câu sau">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 6v12l8-6zM3 6v12l8-6z"/></svg><span>Tới</span>
+      </button>
+    </div>
+  </footer>
+</main>
+
+<!-- ============ CÀI ĐẶT ============ -->
+<div id="sheetSettings" class="sheet" hidden>
+  <div class="sheet-body">
+    <header class="sheet-head">
+      <h2>Giọng đọc &amp; Chữ</h2>
+      <button class="btn primary small" data-close>Xong</button>
+    </header>
+
+    <h3>Tốc độ đọc</h3>
+    <div id="speedList" class="seg"></div>
+
+    <h3>Cỡ chữ</h3>
+    <div class="seg">
+      <button id="btnFontDown" class="btn">A − Nhỏ hơn</button>
+      <button id="btnFontUp" class="btn big-a">A + To hơn</button>
+    </div>
+
+    <h3>Màu nền</h3>
+    <div class="seg" id="themeList">
+      <button class="btn" data-theme="light">Nền sáng</button>
+      <button class="btn" data-theme="dark">Nền tối</button>
+    </div>
+
+    <h3>Ngôn ngữ của tài liệu</h3>
+    <div class="seg" id="langList">
+      <button class="btn" data-lang="vi">Tiếng Việt</button>
+      <button class="btn" data-lang="en">Tiếng Anh</button>
+    </div>
+
+    <h3>Giọng đọc <small>(bấm để chọn và nghe thử)</small></h3>
+    <p id="voiceNote" class="hint" hidden></p>
+    <div id="voiceList"></div>
+  </div>
+</div>
+
+<!-- ============ DÁN VĂN BẢN ============ -->
+<div id="sheetPaste" class="sheet" hidden>
+  <div class="sheet-body">
+    <header class="sheet-head">
+      <h2>Dán văn bản</h2>
+      <button class="btn small" data-close>Đóng</button>
+    </header>
+    <button id="btnClipboard" class="btn">Dán từ bộ nhớ tạm</button>
+    <textarea id="pasteArea" placeholder="Hoặc nhấn giữ vào đây rồi chọn “Dán”…"></textarea>
+    <button id="btnPasteGo" class="btn primary huge center">Đọc văn bản này</button>
+  </div>
+</div>
+
+<!-- ============ ĐI ĐẾN TRANG ============ -->
+<div id="sheetJump" class="sheet" hidden>
+  <div class="sheet-body compact">
+    <header class="sheet-head">
+      <h2>Đi đến trang</h2>
+      <button class="btn small" data-close>Đóng</button>
+    </header>
+    <p id="jumpInfo" class="hint"></p>
+    <input id="jumpInput" type="number" inputmode="numeric" min="1">
+    <button id="btnJumpGo" class="btn primary huge center">Đi đến</button>
+  </div>
+</div>
+
+<!-- ============ THÔNG BÁO ============ -->
+<div id="sheetMsg" class="sheet" hidden>
+  <div class="sheet-body compact">
+    <p id="msgText" class="msg"></p>
+    <button class="btn primary huge center" data-close>Đã hiểu</button>
+  </div>
+</div>
+
+<div id="loading" class="loading" hidden>
+  <div class="spinner"></div>
+  <p id="loadingText">Đang mở tài liệu…</p>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
