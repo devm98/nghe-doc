@@ -43,8 +43,14 @@
           // Tệp PDF gốc của bản scan, để nhận dạng chữ dần từng trang.
           if (!names.contains('files')) r.result.createObjectStore('files');
         };
-        r.onsuccess = () => res(r.result);
-        r.onerror = () => rej(r.error);
+        r.onsuccess = () => {
+          const conn = r.result;
+          // Có bản app mới cần nâng cấp cơ sở dữ liệu (ví dụ đang mở ở tab khác): nhường ngay, lần sau mở lại.
+          conn.onversionchange = () => { conn.close(); dbPromise = null; };
+          res(conn);
+        };
+        r.onerror = () => { dbPromise = null; rej(r.error); };
+        r.onblocked = () => toast('Hãy đóng các cửa sổ Nghe Đọc khác rồi mở lại.');
       });
     }
     return dbPromise;
