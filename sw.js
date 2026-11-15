@@ -1,6 +1,6 @@
 // Lưu sẵn toàn bộ ứng dụng để dùng được khi không có mạng.
 // Bộ máy đọc (vendor/ort/*.wasm, ~10 MB) không lưu sẵn ở đây; nó được lưu khi người dùng tải giọng lần đầu.
-const CACHE = 'nghe-doc-v3';
+const CACHE = 'nghe-doc-v4';
 const ASSETS = [
   './',
   'index.html',

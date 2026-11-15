@@ -36,19 +36,25 @@
   function db() {
     if (!dbPromise) {
       dbPromise = new Promise((res, rej) => {
-        const r = indexedDB.open('nghe-doc', 1);
-        r.onupgradeneeded = () => r.result.createObjectStore('docs', { keyPath: 'id' });
+        const r = indexedDB.open('nghe-doc', 2);
+        r.onupgradeneeded = () => {
+          const names = r.result.objectStoreNames;
+          if (!names.contains('docs')) r.result.createObjectStore('docs', { keyPath: 'id' });
+          // Tệp PDF gốc của bản scan, để nhận dạng chữ dần từng trang.
+          if (!names.contains('files')) r.result.createObjectStore('files');
+        };
         r.onsuccess = () => res(r.result);
         r.onerror = () => rej(r.error);
       });
     }
     return dbPromise;
   }
-  async function idb(mode, fn) {
+  async function idb(mode, fn, storeName) {
     const d = await db();
+    const name = storeName || 'docs';
     return new Promise((res, rej) => {
-      const tx = d.transaction('docs', mode);
-      const rq = fn(tx.objectStore('docs'));
+      const tx = d.transaction(name, mode);
+      const rq = fn(tx.objectStore(name));
       tx.oncomplete = () => res(rq && rq.result);
       tx.onerror = () => rej(tx.error);
       tx.onabort = () => rej(tx.error);
@@ -152,21 +158,50 @@
       .trim();
   }
 
-  async function extractPdf(file) {
+  async function pdfjs() {
     await loadScript('vendor/pdf.min.js');
-    const pdfjsLib = window.pdfjsLib;
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
-    const pdf = await pdfjsLib.getDocument({ data: await readFile(file) }).promise;
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
+    return window.pdfjsLib;
+  }
+
+  // Bản scan: lớp chữ trống, hoặc do máy nhận dạng sai mất dấu tiếng Việt ("Quy lu~t", "Hanh d9ng").
+  // Từ tiếng Việt thường gặp khi bị mất dấu (đã bỏ các từ trùng với tiếng Anh / Tây Ban Nha / Pháp như the, de, la, con).
+  const VI_PLAIN = new Set(('va cua cac nhung duoc trong khong nguoi mot co cho nay voi thi nhu phai biet ' +
+    'hanh tam song gia dinh cong viec theo den ra vao tri tue quy nguyen tac luat sinh hoc ' +
+    'nhan minh cung toi chung dang lam viet nam ve tren duoi khi neu sao').split(' '));
+  function needsOcr(samplePages, info) {
+    const text = samplePages.join(' ');
+    const letters = (text.match(/\p{L}/gu) || []).length;
+    if (letters < 40 * samplePages.length) return true; // gần như không có chữ
+    const viMarks = (text.match(/[ăâđêôơưĂÂĐÊÔƠƯẠ-ỹàáãèéìíòóõùúýĩũÀÁÃÈÉÌÍÒÓÕÙÚÝĨŨ]/g) || []).length;
+    if (viMarks / letters > 0.01) return false; // tiếng Việt có dấu đầy đủ
+    const words = text.toLowerCase().match(/[a-z]+/g) || [];
+    const plainVi = words.filter((w) => VI_PLAIN.has(w)).length;
+    if (words.length && plainVi / words.length > 0.12) return true; // tiếng Việt bị mất dấu
+    return /paper capture|scan/i.test(((info && (info.Producer || '')) + ' ' + ((info && info.Creator) || '')));
+  }
+
+  async function extractPdf(file) {
+    const lib = await pdfjs();
+    const pdf = await lib.getDocument({ data: await readFile(file) }).promise;
     const pages = [];
+    let info = null;
+    try { info = (await pdf.getMetadata()).info; } catch (e) { /* không có */ }
     for (let i = 1; i <= pdf.numPages; i++) {
       loading('Đang mở trang ' + i + ' / ' + pdf.numPages + '…');
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
       pages.push(pdfItemsToText(tc.items));
       page.cleanup();
+      // Xem vài trang đầu là biết có phải bản scan cần nhận dạng lại hay không.
+      if (i === Math.min(5, pdf.numPages) && needsOcr(pages, info)) {
+        const n = pdf.numPages;
+        pdf.destroy();
+        return { ocr: true, pages: new Array(n).fill(null) };
+      }
     }
     pdf.destroy();
-    return pages;
+    return { ocr: false, pages: pages };
   }
 
   async function extractDocx(file) {
@@ -203,8 +238,11 @@
     loading('Đang mở tài liệu…');
     try {
       let pages;
-      if (kind === 'pdf' || type === 'application/pdf') pages = await extractPdf(file);
-      else if (kind === 'docx') pages = paginate(await extractDocx(file));
+      if (kind === 'pdf' || type === 'application/pdf') {
+        const r = await extractPdf(file);
+        if (r.ocr) { await addScannedDoc(name.replace(/\.[^.]+$/, ''), file, r.pages.length); return; }
+        pages = r.pages;
+      } else if (kind === 'docx') pages = paginate(await extractDocx(file));
       else if (kind === 'doc') throw userError('Tệp Word đời cũ (.doc) chưa đọc được. Hãy nhờ người lưu lại thành .docx hoặc PDF rồi mở lại.');
       else if (kind === 'txt' || type.indexOf('text/') === 0) pages = paginate(await readFile(file, 'text'));
       else throw userError('Loại tệp này chưa hỗ trợ. Hãy chọn tệp PDF, Word (.docx) hoặc văn bản (.txt).');
@@ -224,6 +262,121 @@
     const d = { id: Date.now().toString(36), name: name, pages: pages, lang: detectLang(pages), openedAt: Date.now() };
     try { await idb('readwrite', (s) => s.put(d)); } catch (e) { console.warn('Không lưu được tài liệu', e); }
     openDoc(d);
+  }
+
+  async function addScannedDoc(name, file, numPages) {
+    const d = { id: Date.now().toString(36), name: name, pages: new Array(numPages).fill(null), lang: 'vi', ocr: true, openedAt: Date.now() };
+    try {
+      await idb('readwrite', (s) => s.put(file, d.id), 'files');
+      await idb('readwrite', (s) => s.put(d));
+    } catch (e) {
+      console.warn('Không lưu được tài liệu', e);
+      ocr.memFiles[d.id] = file; // vẫn đọc được trong lần mở này
+    }
+    openDoc(d);
+    toast('Đây là bản scan. Máy sẽ nhận dạng chữ từng trang khi đọc.');
+  }
+
+  // ---------- Nhận dạng chữ tiếng Việt cho bản scan (Tesseract, chạy trong máy) ----------
+  const ocr = { worker: null, pdf: null, pdfId: null, queue: Promise.resolve(), pending: new Map(), memFiles: {} };
+
+  function ocrWorker() {
+    if (!ocr.worker) {
+      ocr.worker = loadScript('vendor/tesseract/tesseract.min.js').then(() => window.Tesseract.createWorker('vie', 1, {
+        workerPath: 'vendor/tesseract/worker.min.js',
+        corePath: 'vendor/tesseract/core',
+        langPath: 'vendor/tesseract/lang',
+        workerBlobURL: false,
+        // Không dùng IndexedDB của Tesseract: nếu bị khóa nó treo mãi. Tệp dữ liệu đã được service worker lưu sẵn.
+        cacheMethod: 'none'
+      }));
+      ocr.worker.catch(() => { ocr.worker = null; });
+    }
+    return ocr.worker;
+  }
+  function resetOcrWorker() {
+    const w = ocr.worker;
+    ocr.worker = null;
+    if (w) w.then((x) => x.terminate()).catch(() => {});
+  }
+  function withTimeout(promise, ms) {
+    let t;
+    return Promise.race([promise, new Promise((_, rej) => { t = setTimeout(() => rej(new Error('timeout')), ms); })])
+      .finally(() => clearTimeout(t));
+  }
+
+  async function ocrPdf(d) {
+    if (ocr.pdfId !== d.id) {
+      if (ocr.pdf) { ocr.pdf.destroy(); ocr.pdf = null; ocr.pdfId = null; }
+      const file = ocr.memFiles[d.id] || await idb('readonly', (s) => s.get(d.id), 'files');
+      if (!file) throw userError('Không còn tệp gốc của tài liệu này. Hãy mở lại tệp PDF.');
+      const lib = await pdfjs();
+      ocr.pdf = await lib.getDocument({ data: await readFile(file) }).promise;
+      ocr.pdfId = d.id;
+    }
+    return ocr.pdf;
+  }
+
+  // Ghép các dòng chữ nhận dạng được: dòng nối tiếp câu thì nối lại, dòng mới (mục, tiêu đề) thì tách đoạn.
+  function cleanOcr(text) {
+    // Ký tự rác hay gặp khi máy đọc vết bút, khung, gạch chân trên bản scan.
+    const lines = text.replace(/\r/g, '').replace(/[|`ˆ¬~_\\{}[\]]/g, ' ').replace(/\s*(>>|<<|»|«)\s*/g, ', ').split('\n')
+      .map((l) => l.replace(/\s+/g, ' ').trim()
+        .replace(/^[^\p{L}\p{N}“"'(]+/u, '') // ký hiệu đầu dòng: -, +, •, ➔ …
+        .replace(/^[A-Za-z] (?=\p{Lu})/u, '') // một chữ cái lẻ trước tiêu đề (mũi tên bị đọc thành chữ)
+        .replace(/([.!?:;])(\s+\S{1,2}){1,3}$/u, '$1') // mẩu rác ngắn sau dấu câu cuối dòng: ". c hư", ". w—"
+        .replace(/(\s+([^\p{L}\p{N}\s]{1,3}|[A-Za-z]))+$/u, '') // ký hiệu / chữ cái lẻ cuối dòng
+        .replace(/([,.:;!?])(?=\p{L})/gu, '$1 ').replace(/\s+([,.:;!?])/g, '$1') // khoảng trắng quanh dấu câu (giữ nguyên 1.3)
+        .replace(/\s{2,}/g, ' ')
+        .trim())
+      .map((l) => (/\p{L}/u.test(l) ? l : '')); // bỏ dòng chỉ có số trang / ký hiệu
+    const paras = [];
+    let cur = '';
+    for (const l of lines) {
+      if (!l) { if (cur) { paras.push(cur); cur = ''; } continue; }
+      if (cur && !/[.!?:;…]$/.test(cur) && /^\p{Ll}/u.test(l)) cur = cur.replace(/-$/, '') + (/-$/.test(cur) ? '' : ' ') + l;
+      else { if (cur) paras.push(cur); cur = l; }
+    }
+    if (cur) paras.push(cur);
+    return paras.join('\n\n');
+  }
+
+  // Nhận dạng một trang (lần lượt từng trang một), lưu kết quả để lần sau không phải làm lại.
+  function ocrPage(d, i) {
+    if (d.pages[i] != null) return Promise.resolve(d.pages[i]);
+    const key = d.id + ':' + i;
+    if (ocr.pending.has(key)) return ocr.pending.get(key);
+    const p = ocr.queue.catch(() => {}).then(async () => {
+      if (d.pages[i] != null) return d.pages[i];
+      const pdf = await ocrPdf(d);
+      const page = await pdf.getPage(i + 1);
+      const base = page.getViewport({ scale: 1 });
+      // ~1200px bề ngang: thử trên bản scan thật cho chữ đúng nhất; to hơn lại sai nhiều hơn và chậm hơn.
+      const vp = page.getViewport({ scale: Math.min(2.2, Math.max(1.5, 1200 / base.width)) });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(vp.width);
+      canvas.height = Math.round(vp.height);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+      page.cleanup();
+      let r;
+      try {
+        // Điện thoại yếu có thể mất cả chục giây một trang; quá 2 phút thì coi là lỗi để không treo mãi.
+        r = await withTimeout(ocrWorker().then((w) => w.recognize(canvas)), 120000);
+      } catch (e) {
+        resetOcrWorker();
+        throw e;
+      } finally {
+        canvas.width = canvas.height = 0;
+      }
+      d.pages[i] = cleanOcr(r.data.text);
+      idb('readwrite', (s) => s.put(d)).catch(() => {});
+      return d.pages[i];
+    });
+    ocr.queue = p;
+    ocr.pending.set(key, p);
+    const done = () => ocr.pending.delete(key);
+    p.then(done, done);
+    return p;
   }
 
   // ---------- Thư viện ----------
@@ -251,6 +404,7 @@
       del.onclick = async () => {
         if (!confirm('Xóa tài liệu “' + d.name + '” khỏi danh sách?')) return;
         await idb('readwrite', (s) => s.delete(d.id));
+        idb('readwrite', (s) => s.delete(d.id), 'files').catch(() => {});
         store.del('pos:' + d.id);
         renderLibrary();
       };
@@ -298,11 +452,38 @@
 
   function renderPage(keepSentence) {
     const el = $('#text');
-    const text = doc.pages[st.pi] || '';
+    const raw = doc.pages[st.pi];
+    const text = raw || '';
     el.innerHTML = '';
     st.sentences = [];
+    st.waiting = false;
     if (!keepSentence) st.si = 0;
-    if (!text.trim()) {
+    if (raw == null && doc.ocr) {
+      // Trang scan chưa nhận dạng: làm ngay, xong thì hiện chữ (và đọc tiếp nếu đang đọc).
+      st.waiting = true;
+      const box = document.createElement('div');
+      box.className = 'empty ocr-wait';
+      const spin = document.createElement('div');
+      spin.className = 'spinner';
+      const p = document.createElement('p');
+      p.textContent = 'Đang nhận dạng chữ trang ' + (st.pi + 1) + '…\nMỗi trang mất vài giây, chỉ làm một lần.';
+      box.append(spin, p);
+      el.appendChild(box);
+      const d = doc, pi = st.pi, si = st.si;
+      ocrPage(d, pi).then(() => {
+        if (doc !== d || st.pi !== pi) return;
+        st.si = si;
+        renderPage(true);
+        if (st.playing) speakCurrent();
+      }, (e) => {
+        console.warn('Nhận dạng chữ lỗi', e);
+        if (doc !== d || st.pi !== pi) return;
+        st.waiting = false;
+        p.textContent = e.userMsg || 'Chưa nhận dạng được chữ trang này. Hãy thử lại sau.';
+        spin.remove();
+        if (st.playing) { stop(); toast('Chưa đọc được trang này.'); }
+      });
+    } else if (!text.trim()) {
       const p = document.createElement('p');
       p.className = 'empty';
       p.textContent = 'Trang này không có chữ để đọc (có thể là hình ảnh).';
@@ -321,7 +502,7 @@
         el.appendChild(p);
       });
     }
-    if (st.si >= st.sentences.length) st.si = 0;
+    if (!st.waiting && st.si >= st.sentences.length) st.si = 0;
     const n = doc.pages.length;
     $('#pageLabel').textContent = 'Trang ' + (st.pi + 1) + ' / ' + n;
     $('#progressFill').style.width = ((st.pi + 1) / n * 100) + '%';
@@ -330,6 +511,8 @@
     el.scrollTop = 0;
     highlight();
     savePos();
+    // Bản scan: nhận dạng sẵn trang kế tiếp trong lúc đang đọc trang này.
+    if (doc.ocr && !st.waiting && st.pi + 1 < n && doc.pages[st.pi + 1] == null) ocrPage(doc, st.pi + 1).catch(() => {});
   }
 
   function highlight() {
@@ -726,6 +909,7 @@
       return;
     }
     hush();
+    if (st.waiting) return; // trang scan đang được nhận dạng; xong sẽ tự đọc tiếp
     const mine = token;
     // Bỏ qua các "câu" chỉ có ký hiệu, không có chữ hay số.
     while (st.si < st.sentences.length && !/[\p{L}\p{N}]/u.test(st.sentences[st.si])) st.si++;
@@ -773,7 +957,8 @@
 
   function nextPageAuto() {
     let n = st.pi + 1;
-    while (n < doc.pages.length && !doc.pages[n].trim()) n++;
+    // Bỏ qua trang không có chữ (trang scan chưa nhận dạng thì giữ lại để nhận dạng).
+    while (n < doc.pages.length && doc.pages[n] != null && !doc.pages[n].trim()) n++;
     if (n >= doc.pages.length) {
       stop();
       st.si = 0; highlight(); savePos();
